@@ -7,7 +7,7 @@ Ikuti langkah-langkah di bawah ini untuk menginstal dan menjalankan aplikasi ini
 Pertama, clone repositori ini ke komputer kamu:
 
 ```bash
-git clone https://github.com/username/nama-repo.git
+git clone https://github.com/raihannurhidayat/KI-Steganography-with-methode-DCT.git
 cd nama-repo
 ```
 
