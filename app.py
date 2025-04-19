@@ -4,19 +4,15 @@ import numpy as np
 import itertools
 from PIL import Image
 from io import BytesIO
+from datetime import datetime
+import os
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding, hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
 
-def message2binary(message):
-    if type(message) == str:
-        result = "".join([format(ord(i), "08b") for i in message])
-    elif type(message) == bytes or type(message) == np.ndarray:
-        result = [format(i, "08b") for i in message]
-    elif type(message) == int or type(message) == np.uint8:
-        result = format(message, "08b")
-    else:
-        raise TypeError("Input type is not supported")
-
-    return result
-
+timestampcurrent = datetime.now().strftime("%Y%m%d_%H%M%S")
+filename = f"stego_image_{timestampcurrent}.png"
 
 quant = np.array(
     [
@@ -32,6 +28,56 @@ quant = np.array(
 )
 
 
+# Fungsi Enkripsi/Dekripsi AES
+def encrypt_message(message: str, password: str) -> bytes:
+    if not password:
+        raise ValueError("Password diperlukan untuk enkripsi")
+    salt = os.urandom(16)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+        backend=default_backend(),
+    )
+    key = kdf.derive(password.encode("utf-8"))
+    iv = os.urandom(16)
+    padder = padding.PKCS7(128).padder()
+    padded_message = padder.update(message.encode("utf-8")) + padder.finalize()
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    encrypted = encryptor.update(padded_message) + encryptor.finalize()
+    return salt + iv + encrypted
+
+
+def decrypt_message(ciphertext: bytes, password: str) -> str:
+    if len(ciphertext) < 32:
+        return None
+    salt = ciphertext[:16]
+    iv = ciphertext[16:32]
+    encrypted = ciphertext[32:]
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100000,
+        backend=default_backend(),
+    )
+    try:
+        key = kdf.derive(password.encode("utf-8"))
+    except:
+        return None
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    try:
+        decrypted_padded = decryptor.update(encrypted) + decryptor.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        decrypted = unpadder.update(decrypted_padded) + unpadder.finalize()
+        return decrypted.decode("utf-8")
+    except:
+        return None
+
+
 class DCT:
     def __init__(self):
         self.message = None
@@ -40,242 +86,184 @@ class DCT:
         self.oriRow = 0
         self.numBits = 0
 
-    def encoding_image(self, img, secret_png):
-        secret = secret_png
-        self.message = str(len(secret)) + "*" + secret
-        self.bitMess = self.toBits()
+    def encoding_image(self, img, secret_png, password):
+        try:
+            encrypted_bytes = encrypt_message(secret_png, password)
+            encrypted_str = encrypted_bytes.decode("latin-1")
+            self.message = f"{len(encrypted_str)}*{encrypted_str}"
+            self.bitMess = self.toBits()
 
-        row, col = img.shape[:2]
-        self.oriRow, self.oriCol = row, col
+            row, col = img.shape[:2]
+            self.oriRow, self.oriCol = row, col
 
-        if (col / 8) * (row / 8) < len(secret):
-            print("Error: Message too large to encode in image")
-            return
+            if (col // 8) * (row // 8) < len(encrypted_str) * 1.2:
+                st.error(
+                    "Error: Kapasitas gambar tidak mencukupi untuk pesan terenkripsi"
+                )
+                return None
 
-        if row % 8 != 0 or col % 8 != 0:
-            img = self.addPadd(img, row, col)
+            if row % 8 != 0 or col % 8 != 0:
+                img = self.addPadd(img, row, col)
 
-        row, col = img.shape[:2]
+            row, col = img.shape[:2]
+            bImg, gImg, rImg = cv2.split(img)
+            bImg = np.float32(bImg)
 
-        # split image into RGB channels
-        bImg, gImg, rImg = cv2.split(img)
+            imgBlocks = [
+                np.round(bImg[j : j + 8, i : i + 8] - 128)
+                for (j, i) in itertools.product(range(0, row, 8), range(0, col, 8))
+            ]
 
-        # message to be hid in blue channel so converted to type float32 for dct function
-        bImg = np.float32(bImg)
-        # print(bImg[0:8,0:8])
+            dctBlocks = [cv2.dct(img_Block) for img_Block in imgBlocks]
+            quantizedDCT = [dct_Block / quant for dct_Block in dctBlocks]
 
-        # break into 8x8 blocks
-        imgBlocks = [
-            np.round(bImg[j : j + 8, i : i + 8] - 128)
-            for (j, i) in itertools.product(range(0, row, 8), range(0, col, 8))
-        ]
+            messIndex = 0
+            letterIndex = 0
 
-        dctBlocks = [np.round(cv2.dct(img_Block)) for img_Block in imgBlocks]
+            for quantizedBlock in quantizedDCT:
+                DC = quantizedBlock[0][0]
+                DC = np.uint8(DC)
+                DC_bits = np.unpackbits(DC)
+                DC_bits[7] = int(self.bitMess[messIndex][letterIndex])
+                DC = np.packbits(DC_bits)
+                quantizedBlock[0][0] = np.float32(DC) - 255
 
-        # blocks then run through quantization table
-        quantizedDCT = [np.round(dct_Block / quant) for dct_Block in dctBlocks]
+                letterIndex += 1
+                if letterIndex == 8:
+                    letterIndex = 0
+                    messIndex += 1
+                    if messIndex >= len(self.bitMess):
+                        break
 
-        # set LSB in DC value corresponding bit of message
-        messIndex = 0
-        letterIndex = 0
+            sImgBlocks = [
+                quantizedBlock * quant + 128 for quantizedBlock in quantizedDCT
+            ]
 
-        for quantizedBlock in quantizedDCT:
-            # find LSB in DC coeff and replace with message bit
-            DC = quantizedBlock[0][0]
-            DC = np.uint8(DC)
-            DC = np.unpackbits(DC)
-            # print(DC, end=' ')
-            DC[7] = self.bitMess[messIndex][letterIndex]
-            # print(DC,end= ' ')
-            DC = np.packbits(DC)
+            sImg = []
+            for chunkRowBlocks in self.chunks(sImgBlocks, col // 8):
+                for rowBlockNum in range(8):
+                    for block in chunkRowBlocks:
+                        sImg.extend(block[rowBlockNum])
+            sImg = np.array(sImg).reshape(row, col)
+            sImg = np.uint8(sImg)
+            return cv2.merge((sImg, gImg, rImg))
 
-            # print(DC)
-            DC = np.float32(DC)
-            DC = DC - 255
-            quantizedBlock[0][0] = DC
+        except Exception as e:
+            st.error(f"Error encoding: {str(e)}")
+            return None
 
-            letterIndex = letterIndex + 1
-            if letterIndex == 8:
-                letterIndex = 0
-                messIndex = messIndex + 1
-                if messIndex == len(self.message):
-                    break
+    def decode_image(self, img, password):
+        try:
+            row, col = img.shape[:2]
+            messageBits = []
+            buff = 0
+            messSize = None
+            i = 0
 
-        # print(quantizedDCT[1][0])
+            bImg, gImg, rImg = cv2.split(img)
+            bImg = np.float32(bImg)
 
-        # blocks run inversely through quantization table
-        sImgBlocks = [quantizedBlock * quant + 128 for quantizedBlock in quantizedDCT]
+            imgBlocks = [
+                bImg[j : j + 8, i : i + 8] - 128
+                for (j, i) in itertools.product(range(0, row, 8), range(0, col, 8))
+            ]
 
-        # blocks run through inverse DCT
-        # sImgBlocks = [cv2.idct(B)+128 for B in quantizedDCT]
+            quantizedDCT = [block / quant for block in imgBlocks]
 
-        # puts the new image back together
-        sImg = []
-        for chunkRowBlocks in self.chunks(sImgBlocks, col / 8):
-            for rowBlockNum in range(8):
-                for block in chunkRowBlocks:
-                    sImg.extend(block[rowBlockNum])
-        sImg = np.array(sImg).reshape(row, col)
+            for block in quantizedDCT:
+                DC = np.uint8(block[0][0])
+                DC_bits = np.unpackbits(DC)
+                lsb = DC_bits[7]
 
-        # converted from type float32
-        sImg = np.uint8(sImg)
+                buff |= (lsb ^ 1) << (7 - i)
+                i += 1
 
-        sImg = cv2.merge((sImg, gImg, rImg))
-        # cv2.imwrite(outIm, sImg)
-        return sImg
+                if i == 8:
+                    messageBits.append(chr(buff))
+                    buff = 0
+                    i = 0
 
-    def decode_image(self, img):
-        row, col = img.shape[:2]
+                    if not messSize and "*" in messageBits:
+                        try:
+                            delimiter_index = messageBits.index("*")
+                            size_str = "".join(messageBits[:delimiter_index])
+                            messSize = int(size_str)
+                        except:
+                            continue
 
-        messSize = None
-        messageBits = []
-        buff = 0
+                    if messSize and len(messageBits) >= delimiter_index + 1 + messSize:
+                        encrypted_str = "".join(
+                            messageBits[
+                                delimiter_index + 1 : delimiter_index + 1 + messSize
+                            ]
+                        )
+                        ciphertext = encrypted_str.encode("latin-1")
+                        return decrypt_message(ciphertext, password)
 
-        # split image into RGB channels
-        bImg, gImg, rImg = cv2.split(img)
-        # print(bImg[0:8,0:8])
-        # message hid in blue channel so converted to type float32 for dct function
-        bImg = np.float32(bImg)
-        # print(bImg[0:8,0:8])
+            return ""
 
-        # break into 8x8 blocks
-        imgBlocks = [
-            bImg[j : j + 8, i : i + 8] - 128
-            for (j, i) in itertools.product(range(0, row, 8), range(0, col, 8))
-        ]
-        # blocks run through quantization table
-        # quantizedDCT = [dct_Block/ (quant) for dct_Block in dctBlocks]
-        quantizedDCT = [img_Block / quant for img_Block in imgBlocks]
-        # print(quantizedDCT[1][0])
-        i = 0
-        # message extracted from LSB of DC coeff
-        for quantizedBlock in quantizedDCT:
-            DC = quantizedBlock[0][0]
-            DC = np.uint8(DC)
-            DC = np.unpackbits(DC)
-            if DC[7] == 1:
-                buff += (0 & 1) << (7 - i)
-            elif DC[7] == 0:
-                buff += (1 & 1) << (7 - i)
-            i = 1 + i
-            if i == 8:
-
-                messageBits.append(chr(buff))
-                buff = 0
-                i = 0
-
-                if messageBits[-1] == "*" and messSize is None:
-                    try:
-                        messSize = int("".join(messageBits[:-1]))
-                    except:
-                        pass
-            if len(messageBits) - len(str(messSize)) - 1 == messSize:
-                return "".join(messageBits)[len(str(messSize)) + 1 :]
-
-        # return ""
-        sImgBlocks = [quantizedBlock * quant + 128 for quantizedBlock in quantizedDCT]
-        sImg = []
-        for chunkRowBlocks in self.chunks(sImgBlocks, col / 8):
-            for rowBlockNum in range(8):
-                for block in chunkRowBlocks:
-                    sImg.extend(block[rowBlockNum])
-        sImg = np.array(sImg).reshape(row, col)
-        sImg = np.uint8(sImg)
-        sImg = cv2.merge((sImg, gImg, rImg))
-
-        return ""
+        except Exception as e:
+            st.error(f"Error decoding: {str(e)}")
+            return ""
 
     def chunks(self, l, n):
-        m = int(n)
-        for i in range(0, len(l), m):
-            yield l[i : i + m]
+        for i in range(0, len(l), n):
+            yield l[i : i + n]
 
     def addPadd(self, img, row, col):
-        img = cv2.resize(img, (col + (8 - col % 8), row + (8 - row % 8)))
-        return img
+        new_row = row + (8 - row % 8) if row % 8 != 0 else row
+        new_col = col + (8 - col % 8) if col % 8 != 0 else col
+        return cv2.resize(img, (new_col, new_row))
 
     def toBits(self):
-        bits = []
-
-        for char in self.message:
-            binval = bin(ord(char))[2:].rjust(8, "0")
-
-            # for bit in binval:
-            bits.append(binval)
-
-        self.numBits = bin(len(bits))[2:].rjust(8, "0")
-        return bits
+        return [bin(ord(c))[2:].zfill(8) for c in self.message]
 
 
 dct = DCT()
 
 # UI Streamlit
-st.title("🕵️‍♂️ DCT Image Steganography")
-
-tab1, tab2 = st.tabs(["📥 Embed Message", "📤 Extract Message"])
+st.title("🔐 Secure DCT Image Steganography")
+tab1, tab2 = st.tabs(["🔒 Encode", "🔓 Decode"])
 
 with tab1:
-    st.header("Sisipkan Pesan ke Gambar")
-    uploaded_image = st.file_uploader(
-        "Upload Gambar", type=["png", "jpg", "jpeg"], key="embed"
-    )
-    message = st.text_input("Masukkan Pesan yang Ingin Disisipkan")
+    st.header("Encode Message")
+    img_file = st.file_uploader("Upload cover image", type=["png", "jpg", "jpeg"])
+    secret_msg = st.text_area("Secret Message")
+    encode_pass = st.text_input("Encryption Password", type="password")
 
-    if st.button("🔐 Sisipkan Pesan"):
-        if uploaded_image and message:
-            print(uploaded_image)
-            image = Image.open(uploaded_image).convert("RGB")
-            img_array = np.array(image)
+    if st.button("Encode Message"):
+        if img_file and secret_msg and encode_pass:
+            img = Image.open(img_file).convert("RGB")
+            img_array = np.array(img)
 
-            encoded_img = dct.encoding_image(img_array, message)
-
+            encoded_img = dct.encoding_image(img_array, secret_msg, encode_pass)
             if encoded_img is not None:
-                st.success("Pesan berhasil disisipkan!")
-                st.image(
-                    encoded_img, caption="Gambar dengan pesan", use_column_width=True
-                )
+                st.success("Encoding successful!")
+                st.image(encoded_img, use_column_width=True)
 
-                buffered = BytesIO()
-                result_image = Image.fromarray(encoded_img)
-                result_image.save(
-                    buffered, format="PNG"
-                )  # Simpan sebagai PNG ke buffer
-
+                buf = BytesIO()
+                Image.fromarray(encoded_img).save(buf, format="PNG")
                 st.download_button(
-                    "⬇️ Unduh Gambar",
-                    data=buffered.getvalue(),  # Ambil byte dari buffer
-                    file_name="stego_image.png",
-                    mime="image/png",
+                    "Download Stego Image", buf.getvalue(), filename, "image/png"
                 )
-            else:
-                st.error("Gagal menyisipkan pesan. Gambar terlalu kecil?")
         else:
-            st.warning("Harap unggah gambar dan masukkan pesan.")
+            st.warning("Please fill all fields")
 
 with tab2:
-    st.header("Ekstrak Pesan dari Gambar")
-    uploaded_encoded = st.file_uploader(
-        "Upload Gambar yang Disisipi", type=["png", "jpg", "jpeg"], key="extract"
-    )
+    st.header("Decode Message")
+    stego_file = st.file_uploader("Upload stego image", type=["png", "jpg", "jpeg"])
+    decode_pass = st.text_input("Decryption Password", type="password")
 
-    if st.button("📤 Ekstrak Pesan"):
-        if uploaded_encoded is not None:
+    if st.button("Decode Message"):
+        if stego_file and decode_pass:
             try:
-                image = Image.open(uploaded_encoded)
-                image.verify()  # Verifikasi integritas gambar
-                uploaded_encoded.seek(0)  # Reset pointer
+                img = Image.open(stego_file).convert("RGB")
+                img_array = np.array(img)
 
-                image = Image.open(uploaded_encoded).convert("RGB")
-                img_array = np.array(image)
-
-                extracted_message = dct.decode_image(img_array)
-                print("ini print", extracted_message)
-                if extracted_message:
-                    st.success("Pesan berhasil diambil!")
-                    st.code(extracted_message)
-                else:
-                    st.warning("Tidak ditemukan pesan dalam gambar.")
+                decoded_msg = dct.decode_image(img_array, decode_pass)
+                st.success("Decoded Message:")
+                st.code(decoded_msg)
             except Exception as e:
-                st.error(f"Gagal memproses gambar: {e}")
+                st.error(f"Decoding error: {str(e)}")
         else:
-            st.warning("Harap unggah gambar.")
+            st.warning("Please provide both image and password")
