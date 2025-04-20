@@ -18,7 +18,7 @@ python -m venv venv
 
 ### 3. Aktivasi Virtual Environment
 ```bash
-venv\Scripts\activate
+venv\scripts\activate
 ```
 
 ### 4. Install Dependencies
