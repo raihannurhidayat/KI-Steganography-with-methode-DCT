@@ -55,7 +55,7 @@ def decrypt_message(ciphertext: bytes, password: str) -> str:
 
 
 def main():
-    st.title("🔒 Secure DCT Steganography")
+    st.title("🔒 OccultaPix Secure DCT Steganography")
     tab1, tab2 = st.tabs(["Encode", "Decode"])
 
     with tab1:
